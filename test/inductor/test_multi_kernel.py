@@ -8,7 +8,7 @@ import torch
 from torch import nn
 from torch._dynamo.testing import reset_rng_state
 
-from torch._inductor import config
+from torch._inductor import config, test_operators
 from torch._inductor.codegen.multi_kernel import MultiKernelCall
 from torch._inductor.utils import run_and_get_code
 from torch.nn import functional as F
@@ -46,13 +46,16 @@ def _contains_multi_kernel_code(wrapper_code: str):
 @config.patch({"triton.multi_kernel": 1, "benchmark_kernel": True})
 @instantiate_parametrized_tests
 class MultiKernelTest(TestCase):
-    def test_softmax(self):
+    def test_softmax(self, expect_multi_kernel=True):
         x = torch.rand(2, 1024).cuda()
         ref = torch.softmax(x, -1)
         compiled_fn = torch.compile(torch.softmax)
-        act, (wrapper_code,) = run_and_get_code(compiled_fn, x, -1)
+        act, wrapper_code = run_and_get_code(compiled_fn, x, -1)
         self.assertTrue(torch.allclose(ref, act))
-        self.assertTrue(_contains_multi_kernel_code(wrapper_code))
+        if expect_multi_kernel:
+            self.assertTrue(_contains_multi_kernel_code(wrapper_code[0]))
+        else:
+            self.assertFalse(_contains_multi_kernel_code(wrapper_code[0]))
 
     @parametrize("force_kernel", (0, 1))
     @unittest.mock.patch.dict(
@@ -90,6 +93,21 @@ class MultiKernelTest(TestCase):
     def test_softmax_warn_mixed_layout(self):
         self.test_softmax()
 
+    @config.patch("cpp_wrapper", True)
+    def test_softmax_cpp_wrapper(self):
+        """
+        Multi-kernel does not work when cpp_wrapper is enabled right now. So we disable
+        multi-kernel in that case.
+        """
+
+        # The same kernel may have been compiled by previous tests with
+        # cpp_wrapper disabled. Clear the cache so we go ahead to re-compile
+        # the kernel with cpp_wrapper enabled.
+        from torch._inductor import codecache
+
+        codecache.PyCodeCache.clear()
+        self.test_softmax(False)
+
     def test_layernorm(self):
         ln = nn.LayerNorm(1024).cuda()
         x = torch.rand(2, 1024).cuda()
@@ -114,10 +132,6 @@ class MultiKernelTest(TestCase):
         self.assertTrue(torch.allclose(ref, act))
 
     def test_transformer_snippet(self):
-        """
-        Test a snippet of transformer that will cause different arglist for
-        the persistent and non-persistent flavor of reductions.
-        """
         model = TransformerSnippet().cuda()
         x = model.example_inputs()
 
@@ -194,6 +208,27 @@ class MultiKernelTest(TestCase):
         ref = f(x, y_ref)
         act = torch.compile(f)(x, y)
         self.assertTrue(torch.allclose(y_ref, y))
+
+    def test_reduction_scratch_buffer(self):
+        """
+        The explicited realized buffer in the test function will be passed in
+        as a scratch buffer for the non-persistent reduction kernel but
+        can be skipped for the persistent reduction kernel.
+
+        This causes different argument lists for non-persistent reduction kernel and
+        persistent reduction kernel.
+        """
+
+        def f(x):
+            x = x.sum(dim=-1, keepdim=True) + x
+            x = test_operators.realize(x)
+            x = x.sum(dim=-1, keepdim=True) + x
+            return x
+
+        x = torch.rand(16, 16, device="cuda")
+        ref = f(x)
+        act = torch.compile(f)(x)
+        self.assertTrue(torch.allclose(ref, act))
 
 
 if __name__ == "__main__":

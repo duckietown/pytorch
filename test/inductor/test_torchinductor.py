@@ -567,6 +567,11 @@ def _run_and_assert_no_indirect_indexing(test_case, func, *args, **kwargs):
 
 
 def assertGeneratedKernelCountEqual(self: TestCase, expected: int):
+    if config.triton.multi_kernel:
+        # when multi_kernel is enabled, we generated both persistent reduction
+        # and non-persistent reduction kernels for the same node schedule.
+        # That will mess up with the kernel count. Just don't check it.
+        return
     if config.cpp_wrapper:
         expected *= 2
     self.assertEqual(torch._inductor.metrics.generated_kernel_count, expected)
@@ -1165,7 +1170,20 @@ class CommonTemplate:
             z = x * y
             return z.sum((0, 1))
 
-        self.common(fn, (torch.randn(2, 197, 256), torch.randn(2, 1, 256)))
+        atol = None
+        rtol = None
+
+        # By default, inductor generate non-persistent reduction kernels in this
+        # case. But when multi-kernel is enabled, inductor will pick the faster
+        # of persistent reduction and non-persistent-reduction kernel.
+        # In this case, inductor picked the persistent-reduction kernel.
+        # The persistent reduction kernel happens to need looser tolerance.
+        if config.triton.multi_kernel:
+            atol = 1e-5
+            rtol = 1e-5
+        self.common(
+            fn, (torch.randn(2, 197, 256), torch.randn(2, 1, 256)), atol=atol, rtol=rtol
+        )
 
     def test_min_max_reduction(self):
         def fn(a, b):
