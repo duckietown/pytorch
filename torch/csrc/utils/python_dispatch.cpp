@@ -15,6 +15,7 @@
 #include <c10/core/SafePyObject.h>
 #include <torch/csrc/PyInterpreter.h>
 #include <torch/csrc/autograd/python_variable.h>
+#include <torch/csrc/inductor/aoti_runner/model_container_runner.h>
 #include <torch/csrc/jit/python/pybind_utils.h>
 
 #include <c10/util/flat_hash_map.h>
@@ -24,6 +25,7 @@
 #include <torch/csrc/utils/python_raii.h>
 
 #include <iostream>
+#include <memory>
 #include <utility>
 
 namespace py = pybind11;
@@ -191,6 +193,226 @@ class PythonKernelHolder : public c10::OperatorKernel {
   }
 };
 
+struct TensorMetaInfo {
+  c10::ScalarType dtype;
+  c10::Device device;
+  c10::IntArrayRef sizes;
+  c10::IntArrayRef strides;
+
+  TensorMetaInfo(
+      c10::ScalarType dtype,
+      c10::Device device,
+      c10::IntArrayRef sizes,
+      c10::IntArrayRef strides)
+      : dtype(dtype), device(device), sizes(sizes), strides(strides) {}
+
+  bool operator==(const TensorMetaInfo& other) const {
+    return dtype == other.dtype && device == other.device &&
+        sizes == other.sizes && strides == other.strides;
+  }
+};
+
+struct TensorMetaInfoHash {
+  size_t operator()(
+      const torch::impl::dispatch::TensorMetaInfo& tensor_meta_info) const {
+    auto hash = std::hash<c10::ScalarType>()(tensor_meta_info.dtype);
+    hash = c10::hash_combine(
+        hash, std::hash<c10::Device>()(tensor_meta_info.device));
+    for (auto& e : tensor_meta_info.sizes) {
+      hash = c10::hash_combine(hash, std::hash<int64_t>()(e));
+    }
+    for (auto& e : tensor_meta_info.strides) {
+      hash = c10::hash_combine(hash, std::hash<int64_t>()(e));
+    }
+    return hash;
+  }
+};
+
+using AOTIKernelMetaInfo = std::vector<TensorMetaInfo>;
+
+struct AOTIKernelMetaInfoHash {
+  size_t operator()(const std::vector<torch::impl::dispatch::TensorMetaInfo>&
+                        aoti_kernel_meta_info) const {
+    size_t hash = 0;
+    for (auto& e : aoti_kernel_meta_info) {
+      hash = c10::hash_combine(hash, TensorMetaInfoHash()(e));
+    }
+    return hash;
+  }
+};
+
+enum class IValueType : uint8_t {
+  Tensor,
+  TensorList,
+  OptionalTensorList,
+  Scalar,
+  Invalid,
+};
+
+class UnpackTensorHandler {
+  using HandlerFunc = std::function<
+      bool(const IValue&, std::vector<at::Tensor>&, c10::Device&)>;
+
+ private:
+  std::unordered_map<IValueType, HandlerFunc> handlers_;
+
+ public:
+  UnpackTensorHandler() {
+    handlers_[IValueType::Tensor] = &UnpackTensorHandler::HandleTensor;
+    handlers_[IValueType::TensorList] = &UnpackTensorHandler::HandleTensorList;
+    handlers_[IValueType::OptionalTensorList] =
+        &UnpackTensorHandler::HandleOptionalTensorList;
+    handlers_[IValueType::Scalar] = &UnpackTensorHandler::HandleScalar;
+  }
+
+  bool HandleIValue(
+      const IValue& ivalue,
+      std::vector<at::Tensor>& inputs,
+      c10::Device& device) {
+    IValueType ivalue_type = IValueType::Invalid;
+    if (ivalue.isTensor()) {
+      ivalue_type = IValueType::Tensor;
+    } else if (ivalue.isTensorList()) {
+      ivalue_type = IValueType::TensorList;
+    } else if (ivalue.isOptionalTensorList()) {
+      ivalue_type = IValueType::OptionalTensorList;
+    } else if (ivalue.isScalar()) {
+      ivalue_type = IValueType::Scalar;
+    }
+
+    auto it = handlers_.find(ivalue_type);
+    if (it != handlers_.end()) {
+      return it->second(ivalue, inputs, device);
+    }
+    // Handle unsupported types or add a default handler
+    return false;
+  }
+
+  static bool HandleTensor(
+      const IValue& ivalue,
+      std::vector<at::Tensor>& inputs,
+      c10::Device& device) {
+    inputs.push_back(ivalue.toTensor());
+    return true;
+  }
+
+  static bool HandleTensorList(
+      const IValue& ivalue,
+      std::vector<at::Tensor>& inputs,
+      c10::Device& device) {
+    for (const auto& item : ivalue.toListRef()) {
+      if (!item.isNone()) {
+        inputs.push_back(item.toTensor());
+      }
+    }
+    return true;
+  }
+
+  static bool HandleOptionalTensorList(
+      const IValue& ivalue,
+      std::vector<at::Tensor>& inputs,
+      c10::Device& device) {
+    return HandleTensorList(ivalue, inputs, device);
+  }
+
+  static bool HandleScalar(
+      const IValue& ivalue,
+      std::vector<at::Tensor>& inputs,
+      c10::Device& device) {
+    inputs.push_back(at::scalar_tensor(
+        ivalue.toScalar(),
+        c10::TensorOptions().device(device).dtype(ivalue.toScalar().type())));
+    return true;
+  }
+
+  // Add more static handler functions as needed
+};
+
+class AOTIPythonKernelHolder : public c10::OperatorKernel {
+  PythonKernelHolder python_kernel_holder_;
+  c10::DispatchKey dispatch_key_;
+  c10::string_view op_name_;
+  c10::optional<c10::Device> device_opt_;
+  UnpackTensorHandler unpack_tensor_handler_;
+
+  using _AOTIModelContainerRunner = torch::inductor::AOTIModelContainerRunner;
+  std::unordered_map<
+      AOTIKernelMetaInfo,
+      _AOTIModelContainerRunner*,
+      AOTIKernelMetaInfoHash>
+      cache_;
+
+ public:
+  AOTIPythonKernelHolder(
+      py::object func,
+      c10::DispatchKey dispatch_key,
+      c10::string_view op_name)
+      : python_kernel_holder_(std::move(func), dispatch_key),
+        dispatch_key_(dispatch_key),
+        op_name_(op_name),
+        device_opt_(c10::nullopt),
+        unpack_tensor_handler_() {
+    // TODO: Load all aten kernel according to op_name and dispatch key
+    if (dispatch_key_ == c10::DispatchKey::CUDA) {
+      device_opt_ = c10::Device(c10::DeviceType::CUDA, 0);
+    } else if (dispatch_key_ == c10::DispatchKey::XPU) {
+      device_opt_ = c10::Device(c10::DeviceType::XPU, 0);
+    } else {
+      device_opt_ = c10::Device(c10::DeviceType::CPU);
+    }
+  }
+
+  void operator()(
+      const c10::OperatorHandle& op,
+      c10::DispatchKeySet keyset,
+      torch::jit::Stack* stack) {
+    std::vector<at::Tensor> inputs;
+    auto res = unpackTensors(*stack, inputs);
+    if (!res || inputs.empty()) {
+      python_kernel_holder_(op, keyset, stack);
+      return;
+    }
+
+    auto inputs_meta_info = getInputsMetaInfo(inputs);
+    auto kernel_handle = cache_.find(inputs_meta_info);
+    if (kernel_handle == cache_.end()) {
+      // Cache miss
+      python_kernel_holder_(op, keyset, stack);
+      return;
+    }
+
+    // Cache hit
+    // TODO: Check different devices
+    auto outputs = kernel_handle->second->run(inputs);
+    for (auto& output : outputs) {
+      stack->push_back(output);
+    }
+  }
+
+ private:
+  bool unpackTensors(
+      const torch::jit::Stack& stack,
+      std::vector<at::Tensor>& inputs) {
+    for (const auto& ivalue : stack) {
+      if (!unpack_tensor_handler_.HandleIValue(
+              ivalue, inputs, device_opt_.value())) {
+        // TODO: Handle non-tensor parameter
+        return false;
+      }
+    }
+    return true;
+  }
+
+  AOTIKernelMetaInfo getInputsMetaInfo(const std::vector<at::Tensor>& inputs) {
+    AOTIKernelMetaInfo inputs_meta_info;
+    for (const auto& input : inputs) {
+      inputs_meta_info.push_back(TensorMetaInfo(
+          input.scalar_type(), input.device(), input.sizes(), input.strides()));
+    }
+    return inputs_meta_info;
+  }
+};
+
 static torch::_RegisterOrVerify register_or_verify() {
   if (isMainPyInterpreter()) {
     return torch::_RegisterOrVerify::REGISTER;
@@ -336,6 +558,32 @@ void initDispatchBindings(PyObject* module) {
           py::arg("name"),
           py::arg("dispatch") = "",
           py::arg("debug") = "impl_t_t")
+      .def(
+          "impl_t_c",
+          [](const py::object& self,
+             const char* name,
+             c10::DispatchKey dispatch,
+             py::object func) {
+            HANDLE_TH_ERRORS
+            auto& lib = self.cast<torch::Library&>();
+            lib.impl(
+                name,
+                torch::dispatch(
+                    dispatch,
+                    CppFunction::makeFromBoxedFunctor(
+                        std::make_unique<AOTIPythonKernelHolder>(
+                            func, dispatch, name))),
+                register_or_verify());
+            python_registrations_[lib._resolve(name)].insert_or_assign(
+                dispatch,
+                std::make_shared<c10::SafePyObject>(
+                    func.release().ptr(), getPyInterpreter()));
+            END_HANDLE_TH_ERRORS_PYBIND
+          },
+          "",
+          py::arg("name"),
+          py::arg("dispatch"),
+          py::arg("func"))
       .def(
           "impl",
           [](const py::object& self,
