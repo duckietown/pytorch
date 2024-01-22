@@ -1,4 +1,5 @@
 import copy
+from collections import namedtuple
 import dataclasses
 import functools
 import types
@@ -213,7 +214,7 @@ class ExportedProgram:
     @property
     @compatibility(is_backward_compatible=False)
     def call_spec(self):
-        from torch._export.exported_program import CallSpec
+        CallSpec = namedtuple("CallSpec", ["in_spec", "out_spec"])
 
         if len(self.module_call_graph) == 0:
             return CallSpec(in_spec=None, out_spec=None)
