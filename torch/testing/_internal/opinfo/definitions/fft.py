@@ -477,7 +477,7 @@ op_db: List[OpInfo] = [
         dtypes=all_types_and(torch.bool),
         # CUDA supports Half/ComplexHalf Precision FFT only on SM53 or later archs
         dtypesIfCUDA=all_types_and(
-            torch.bool, *(() if (TEST_WITH_ROCM or not SM53OrLater) else (torch.half,))
+            torch.bool, *(() if (not SM53OrLater) else (torch.half,))
         ),
         check_batched_grad=False,
         check_batched_gradgrad=False,
@@ -509,7 +509,7 @@ op_db: List[OpInfo] = [
         dtypes=all_types_and(torch.bool),
         # CUDA supports Half/ComplexHalf Precision FFT only on SM53 or later archss
         dtypesIfCUDA=all_types_and(
-            torch.bool, *(() if (TEST_WITH_ROCM or not SM53OrLater) else (torch.half,))
+            torch.bool, *(() if (not SM53OrLater) else (torch.half,))
         ),
         check_batched_grad=False,
         check_batched_gradgrad=False,
