@@ -260,6 +260,7 @@ def run_and_get_cpp_code(fn, *args, **kwargs):
     # even if this run_and_get_cpp_code function is called multiple times.
     with patch.object(config, "debug", True):
         torch._dynamo.reset()
+        torch._inductor.codecache.FxGraphCache.clear()
         import io
         import logging
 

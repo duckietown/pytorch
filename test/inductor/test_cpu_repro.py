@@ -889,6 +889,7 @@ class CPUReproTests(TestCase):
                 scale = torch.tensor(scale)
             with config.patch({"cpp.simdlen": None}):
                 torch._dynamo.reset()
+                torch._inductor.codecache.FxGraphCache.clear()
                 metrics.reset()
                 self.common(fn, (x, scale, zero_point, use_dequant, use_quant))
                 assert metrics.generated_cpp_vec_kernel_count == 1
