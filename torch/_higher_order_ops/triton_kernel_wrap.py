@@ -1,7 +1,7 @@
-import ast
 import dataclasses
+import logging
 import threading
-from typing import Any, Dict
+from typing import Any, Dict, List, Union
 
 import torch.utils._pytree as pytree
 from torch import Tensor
@@ -14,6 +14,8 @@ from torch.fx.experimental.proxy_tensor import (
     ProxyTorchDispatchMode,
     track_tensor_tree,
 )
+
+log = logging.getLogger("torch._dynamo")
 
 
 ###############################################################################
@@ -60,88 +62,176 @@ kernel_side_table = KernelSideTable()
 # Mutation Tracker
 
 
-@dataclasses.dataclass
-class MutationInfo:
-    mutated: bool = False
-    used_in_unknown: bool = False
+# Given a triton kernel and the arguments for this kernel, this function traces
+# through the triton kernel and identifies which input pointers are mutated.
+# Tracing is done by replacing the input pointers with Proxy objects that
+# track mutation. Each triton language function is monkey patched to
+# either detect the mutation or return a fresh scalar object.
+def identify_mutated_tensors(kernel, kwargs):
+    import functools
 
+    import triton
+    from triton.compiler.code_generator import ast_to_ttir
+    from triton.runtime.jit import JITFunction
 
-# Super basic mutation tracking pass that tracks which inputs are used in stores
-# It bails if any of the inputs are used in non tl.load/tl.store positions.
-# This pass will miss simple things like
-# a = in_ptr
-# tl.load(a, ...)
-# since it does not do any contextual analysis. This means that we might incorrectly
-# find extra mutations but this is safe as it would only be incorrect to miss
-# mutations.
-class MutationTracker(ast.NodeVisitor):
-    ALLOWED_READ_FNS = {
-        "load",
-        "max_constancy",
-        "max_contiguous",
-        "multiple_of",
-        "static_print",
-        "static_assert",
-        "device_print",
-        "device_assert",
+    assert isinstance(kernel, JITFunction)
+
+    args = [val for key, val in kwargs.items()]
+
+    specialization = kernel._get_config(*args)
+    constants = {i: arg for i, arg in enumerate(args) if not isinstance(arg, Tensor)}
+    debug = None
+    target = None
+
+    # Build kernel signature -- doesn't include constexpr arguments.
+    signature = {
+        i: kernel._type_of(kernel._key_of(arg))
+        for i, arg in enumerate(args)
+        if i not in kernel.constexprs
     }
 
-    def __init__(self, infos) -> None:
-        super().__init__()
-        self.infos = infos
-        self.read_depth = 0
-        self.in_store = False
+    @dataclasses.dataclass(frozen=True)
+    class TensorParam:
+        idx: int
 
-    def visit_Name(self, node):
-        if node.id not in self.infos:
-            return
-        if self.read_depth:
+    @dataclasses.dataclass(frozen=True)
+    class NonTensorParam:
+        source: Any
+        pass
+
+    @dataclasses.dataclass(frozen=True)
+    class Intermediate:
+        idx: int
+
+    mappings: Dict[Any, Union[TensorParam, NonTensorParam, Intermediate]] = dict()
+    next_intermediate = 0
+
+    def convert(arg):
+        if isinstance(arg, triton._C.libtriton.triton.ir.block_argument):
+            if arg not in mappings:
+                mappings[arg] = NonTensorParam(arg)
+            return mappings[arg]
+        if isinstance(arg, triton._C.libtriton.triton.ir.value):
+            if arg not in mappings:
+                nonlocal next_intermediate
+                mappings[arg] = Intermediate(next_intermediate)
+                next_intermediate += 1
+            return mappings[arg]
+        return arg
+
+    # Name of mutation op to mutated parameter indices
+    MUTATION_OPS = {"masked_store": [0]}
+
+    ops: Dict[Union[TensorParam, NonTensorParam, Intermediate], "Op"] = dict()
+    sinks: List["Op"] = []
+
+    @dataclasses.dataclass
+    class Op:
+        name: str
+        args: List[Any]
+        kwargs: Dict[str, Any]
+
+        @staticmethod
+        def create(name, args, kwargs, result):
+            op = Op(name, [convert(a) for a in args], kwargs)
+            ops[convert(result)] = op
+            if name in MUTATION_OPS:
+                sinks.append(op)
+
+    class MutationAnalysisWrapper:
+        def __init__(self, builder):
+            self.builder = builder
+
+        def __getattr__(self, name):
+            def generic_indirection(name, *args, **kwargs):
+                result = getattr(self.builder, name)(*args, **kwargs)
+
+                if name.startswith("create_"):
+                    Op.create(name[len("create_") :], args, kwargs, result)
+                elif name in {"get_int32"}:
+                    Op.create(name[len("get_") :], args, kwargs, result)
+                elif name in {"get_loc", "set_loc"}:
+                    pass
+                else:
+                    pass
+                return result
+
+            return functools.partial(generic_indirection, name)
+
+    original_add_entry_block = triton._C.libtriton.triton.ir.function.add_entry_block
+
+    def custom_add_entry_block(self):
+        result = self.original_add_entry_block()
+        for i, arg in enumerate(args):
+            if isinstance(arg, Tensor):
+                mappings[self.args(i)] = TensorParam(i)
+        return result
+
+    triton._C.libtriton.triton.ir.function.add_entry_block = custom_add_entry_block
+    triton._C.libtriton.triton.ir.function.original_add_entry_block = (
+        original_add_entry_block
+    )
+
+    OriginalCodeGenerator = triton.compiler.code_generator.CodeGenerator
+
+    class CustomCodeGenerator(OriginalCodeGenerator):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.builder = MutationAnalysisWrapper(self.builder)
+
+        def visit_compound_statement(self, *args, **kwargs):
+            super().visit_compound_statement(*args, **kwargs)
+            breakpoint()
+
+    triton.compiler.code_generator.CodeGenerator = CustomCodeGenerator
+
+    try:
+        ttir_module = ast_to_ttir(
+            kernel, signature, specialization, constants, debug, target
+        )
+    except Exception as e:
+        import traceback
+
+        log.debug(
+            "Encountered an exception in identify_mutated_tensors, assuming every input is mutated"
+        )
+        log.debug(
+            "".join(
+                traceback.TracebackException.from_exception(e).format()  # noqa: G001
+            )
+        )
+        return [key for key, value in kwargs.items() if isinstance(value, Tensor)]
+    finally:
+        triton._C.libtriton.triton.ir.function.add_entry_block = (
+            original_add_entry_block
+        )
+        triton.compiler.code_generator.CodeGenerator = OriginalCodeGenerator
+
+    stack = []
+    for sink in sinks:
+        for idx in MUTATION_OPS[sink.name]:
+            stack.append(sink.args[idx])
+
+    mutated = [False] * len(kwargs)
+    while len(stack):
+        arg = stack[-1]
+        stack.pop()
+
+        if isinstance(arg, TensorParam):
+            mutated[arg.idx] = True
+        elif isinstance(arg, NonTensorParam):
             pass
-        elif self.in_store:
-            self.infos[node.id].mutated = True
+        elif isinstance(arg, Intermediate):
+            for a in ops[arg].args:
+                stack.append(a)
         else:
-            self.infos[node.id].used_in_unknown = True
+            # There are some scalar args
+            pass
 
-    def visit_Call(self, node):
-        # TODO(oulgen): Here we assume that there exists a line called
-        # from triton import language as tl. This needs to be checked
-        # as if someones imports xyz as tl then we will incorrectly
-        # assume a mutation but this would be ok as it is only unsafe to
-        # miss a mutation.
-        if (
-            isinstance(node.func, ast.Attribute)
-            and isinstance(node.func.value, ast.Name)
-            and node.func.value.id == "tl"
-        ):
-            if node.func.attr == "store":
-                # Do not allow for store to appear inside a read
-                # tl.load(a if tl.store(b) else z) is not useful
-                # and allowing this would complicate the analysis
-                assert self.read_depth == 0
-                assert self.in_store is False
-                self.in_store = True
-                self.generic_visit(node)
-                self.in_store = False
-                return
-            if node.func.attr in self.ALLOWED_READ_FNS:
-                self.read_depth += 1
-                self.generic_visit(node)
-                self.read_depth -= 1
-                return
-        self.generic_visit(node)
-
-
-def filter_non_mutated(kernel, tensors):
-    from triton.runtime.autotuner import Autotuner
-
-    if isinstance(kernel, Autotuner):
-        kernel = kernel.fn
-
-    infos = {name: MutationInfo() for name in tensors}
-    tracker = MutationTracker(infos)
-    tracker.visit(kernel.parse())
     return [
-        name for name, info in infos.items() if info.mutated or info.used_in_unknown
+        key
+        for i, (key, value) in enumerate(kwargs.items())
+        if isinstance(value, Tensor) and mutated[i]
     ]
 
 
@@ -226,15 +316,12 @@ def triton_kernel_wrapper_mutation_proxy_torch_dispatch_mode(
 @triton_kernel_wrapper_mutation.py_functionalize_impl
 def triton_kernel_wrapper_mutation_functionalize(ctx, kernel_idx, grid, kwargs):
     unwrapped_kwargs = ctx.unwrap_tensors(kwargs)
-    tensors_to_clone = [
-        key for key, value in unwrapped_kwargs.items() if isinstance(value, Tensor)
-    ]
     kernel = kernel_side_table.get_kernel(kernel_idx)
     # TODO(oulgen): Preexisting bug, if two kernel inputs are views of each
     # other, and one gets mutated in kernel, and later another gets mutated,
     # they are no longer equal. Fix this by graph breaking on this condition
     # earlier in dynamo.
-    tensors_to_clone = filter_non_mutated(kernel, tensors_to_clone)
+    tensors_to_clone = identify_mutated_tensors(kernel, unwrapped_kwargs)
     with ctx.redispatch_to_next():
         unwrapped_outputs = triton_kernel_wrapper_functional(
             kernel_idx=kernel_idx,
