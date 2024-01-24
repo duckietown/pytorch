@@ -600,6 +600,853 @@ static struct PyModuleDef _module = {
     -1,
     _methods};
 
+#define NULL_CHECK(val)                                                      \
+  if (val == nullptr) {                                                      \
+    std::cout << "NULL ERROR: " << __FILE__ << ":" << __LINE__ << std::endl; \
+    PyErr_Print();                                                           \
+    std::abort();                                                            \
+  }
+
+// Uncomment next line to print debug message
+#define TORCHDYNAMO_DEBUG 1
+
+#ifdef TORCHDYNAMO_DEBUG
+
+#define DEBUG_NULL_CHECK(val) NULL_CHECK(val)
+
+#else
+
+#define DEBUG_NULL_CHECK(val)
+
+#endif
+
+/**
+ * Stores relevant guard debug information, e.g., failure str for a LeafGuard
+ * failure. The data structure is also accessible in Python.
+ */
+struct GuardDebugInfo {
+  GuardDebugInfo(bool result, std::string failed_guard, int num_guards_executed)
+      : result(result),
+        failed_guard(failed_guard),
+        num_guards_executed(num_guards_executed) {}
+
+  // Whether the guard passed or failed.
+  bool result;
+
+  // Failed guard
+  std::string failed_guard;
+
+  // Total number of executed guards so far.
+  int num_guards_executed;
+};
+
+/**
+ * Base class for the terminal or leaf guard in the GuardManager hierarchy.
+ */
+class LeafGuard {
+ public:
+  LeafGuard(py::object guard_str)
+      : _guard_str(py::cast<std::string>(guard_str)) {}
+
+  // check function could be called from python. This is useful for debugging
+  // purpose.
+  bool check(py::handle value) {
+    return check_nopybind(value.ptr());
+  }
+
+  GuardDebugInfo check_verbose(py::handle value) {
+    return check_verbose_nopybind(value.ptr());
+  }
+
+  GuardDebugInfo check_verbose_nopybind(PyObject* value) { // borrowed ref
+    bool result = check_nopybind(value);
+    std::string failed_guard = "";
+    if (!result) {
+      failed_guard = repr();
+    }
+    return GuardDebugInfo(result, failed_guard, 0);
+  }
+
+  std::string repr() {
+    return repr_prefix() + ": " + _guard_str;
+  }
+
+  // This is on the hot path and avoids any refcounting code from pybind. This
+  // is not exposed to Python and can only be called from C++.
+  virtual bool check_nopybind(PyObject* value) = 0;
+  virtual std::string repr_prefix() = 0;
+  virtual ~LeafGuard() = default;
+
+ private:
+  std::string _guard_str;
+};
+
+/**
+ * Represents a leaf guard that accepts the python guard check function. We
+ * would like to have most of the guards in C++ (to avoid a Python function
+ * call).  But, it will take some time to reach that goal. Also, there might be
+ * cases where its too tedious to write an equivalent C++ guard.
+ *
+ * PythonLambdaGuard allows us to gradually move to C++. We can start from all
+ * guards of type PythonLambaGuard and incrementally move expensive guards to
+ * C++.
+ */
+class PythonLambdaGuard : public LeafGuard {
+ public:
+  PythonLambdaGuard(py::object guard_check_fn, py::object guard_str)
+      : LeafGuard(guard_str) {
+    if (py::isinstance<py::function>(guard_check_fn)) {
+      _guard_check_fn = py::cast<py::function>(guard_check_fn);
+      _guard_check_fn_pyobj = _guard_check_fn.ptr();
+    } else {
+      throw py::type_error("PythonLambdaGuard expects (callable, str)");
+    }
+  }
+
+  // Runs the lambda function with the current f_locals value.
+  bool check_nopybind(PyObject* value) override { // borrowed ref
+    PyObject* x = PyObject_CallOneArg(_guard_check_fn_pyobj, value); // new ref
+    bool result = PyObject_IsTrue(x);
+    Py_DECREF(x);
+    return result;
+  }
+
+  std::string repr_prefix() override {
+    return "PythonLambdaGuard";
+  }
+
+ private:
+  // The user provided lambda function for check_fn.
+  py::function _guard_check_fn;
+  PyObject* _guard_check_fn_pyobj;
+};
+
+class TYPE_MATCH : public LeafGuard {
+ public:
+  // type_id = id(type(obj))
+  TYPE_MATCH(py::object type_id, py::object guard_str)
+      : LeafGuard(guard_str), _expected(py::cast<unsigned long>(type_id)) {}
+
+  bool check_nopybind(PyObject* value) override { // borrowed ref
+    return Py_TYPE(value) == (void*)_expected;
+  }
+
+  std::string repr_prefix() override {
+    return "TYPE_MATCH";
+  }
+
+ private:
+  // id of the type of the original object.
+  unsigned long _expected;
+};
+
+class ID_MATCH : public LeafGuard {
+ public:
+  // obj_id = id(obj)
+  ID_MATCH(py::object obj_id, py::object guard_str)
+      : LeafGuard(guard_str), _expected(py::cast<unsigned long>(obj_id)) {}
+
+  bool check_nopybind(PyObject* value) override { // borrowed ref
+    return value == (void*)_expected;
+  }
+
+  std::string repr_prefix() override {
+    return "ID_MATCH";
+  }
+
+ private:
+  // id of the original object.
+  unsigned long _expected;
+};
+
+class EQUALS_MATCH : public LeafGuard {
+ public:
+  EQUALS_MATCH(py::object value, py::object guard_str)
+      : LeafGuard(guard_str), _value(value.ptr()) {}
+
+  bool check_nopybind(PyObject* value) override { // borrowed ref
+    return PyObject_RichCompareBool(value, _value, Py_EQ);
+  }
+
+  std::string repr_prefix() override {
+    return "EQUALS_MATCH";
+  }
+
+ private:
+  // value to compare against.
+  PyObject* _value;
+};
+
+class LENGTH_CHECK : public LeafGuard {
+ public:
+  LENGTH_CHECK(py::object value, py::object guard_str)
+      : LeafGuard(guard_str), _length(py::cast<Py_ssize_t>(value)) {}
+
+  bool check_nopybind(PyObject* value) override { // borrowed ref
+    return Py_SIZE(value) == _length;
+    // return PyList_Size(value) == _length;
+    // return PyObject_RichCompareBool(value, _value, Py_EQ);
+  }
+
+  std::string repr_prefix() override {
+    return "LENGTH_CHECK";
+  }
+
+ private:
+  // Length of the guarded list
+  Py_ssize_t _length;
+};
+
+class DICT_KEYS : public LeafGuard {
+ public:
+  DICT_KEYS(py::object keys, py::object guard_str)
+      : LeafGuard(guard_str), _keys(PyDict_Keys(keys.ptr())) {}
+
+  bool check_nopybind(PyObject* value) override { // borrowed ref
+    PyObject* keys = PyDict_Keys(value); // new ref - of type PyListObject
+    bool result = PyObject_RichCompareBool(keys, _keys, Py_EQ);
+    Py_DECREF(keys);
+    return result;
+  }
+
+  std::string repr_prefix() override {
+    return "DICT_KEYS";
+  }
+
+ private:
+  // keys to compare against.
+  PyObject* _keys;
+};
+
+/**
+ * Relational guards compare more than one value. We implement Relational guards
+ * by capturing some state in the guard object. For example for tensor aliasing
+ * guards - tensor X is not tensor Y - we construct one leaf guard and and
+ * install it at as a leaf of two guard managers (one for X and another for Y).
+ * Therefore, this guard is run twice. In the first invocation, it saves the
+ * first value (state) and returns True. In the second invocation, it compares
+ * the saved value with the new value and returns True if they do not alias.
+ *
+ * We have to be careful about resetting in case the other guards fail and we
+ * have some state in the relational guard. This is done by virtual method
+ * reset_state_on_guard_failure(). This is called by the GuardManager whenever
+ * there is a guard failure. In the event that the Guard evals to true, we do
+ * not need to reset the state. THe check_nopybind method should itself reset
+ * the state if it was called N times. So, fast path is unaffected.
+ *
+ * There is a question on which GuardManager node calls the
+ * reset_state_on_guard_failure. This is done by registering the guard as a
+ * relational_guard_resetter on the root node, which calls the resets all the
+ * relational guards on guard evaluation to False.
+ */
+class RelationalGuard : public LeafGuard {
+ public:
+  RelationalGuard(py::object guard_str) : LeafGuard(guard_str) {}
+
+  // reset the relational guard state on guard failure. This is called by the
+  // guard manager.
+  virtual void reset_state_on_guard_failure() = 0;
+};
+
+/**
+ * Checks that tensor x in tensor y.
+ */
+class NoTensorAliasingGuard : public RelationalGuard {
+ public:
+  NoTensorAliasingGuard(py::object guard_str)
+      : RelationalGuard(guard_str), _is_first_call(true) {}
+
+  bool check_nopybind(PyObject* value) override { // borrowed ref
+    if (_is_first_call) {
+      _first_tensor = value;
+      _is_first_call = false;
+      return true;
+    }
+    bool result = _first_tensor != value;
+    _is_first_call = true;
+    return result;
+  }
+
+  void reset_state_on_guard_failure() override {
+    _is_first_call = true;
+  }
+
+  std::string repr_prefix() override {
+    return "NoTensorAliasingGuard";
+  }
+
+ private:
+  bool _is_first_call;
+  PyObject* _first_tensor;
+};
+
+class GuardManager;
+class RootGuardManager;
+/**
+ * Base class representing a pair of accessor and the associated guard manager.
+ * The accessor defines how to access the child value from the py::object given
+ * to the parent check function.
+ *
+ * GuardAccessors can be considered equivalent to name() method of Source
+ * objects in guards.py. In python, name() method returns a str which we can
+ * then eval in f_locals and f_globals to retrieve the actual py object.
+ * GuardAccessor serves the same purpose. The minor difference is that
+ * GuardManager is a tree structure, so a GuardAccessor just has to retrieve the
+ * value in the next level in this tree and pass it to the child GuardAccessor.
+ *
+ * GuardAccessor also owns the GuardManager associated with the retrieved value
+ * from the GuardAccessor.
+ */
+class GuardAccessor {
+ public:
+  GuardAccessor(RootGuardManager* root, py::object accessor_key)
+      : _guard_manager(std::make_unique<GuardManager>(root)),
+        _accessor_key(std::move(accessor_key)) {}
+
+  // Return by reference as GuardAccessor owns the GuardManager.
+  std::unique_ptr<GuardManager>& get_guard_manager() {
+    return _guard_manager;
+  }
+
+  bool matches_key(const py::object key) const {
+    return _accessor_key.equal(key);
+  }
+
+  virtual bool check_nopybind(PyObject* obj) = 0;
+  virtual GuardDebugInfo check_verbose_nopybind(PyObject* obj) = 0;
+  virtual std::string repr() const = 0;
+
+  // Returns a new reference. It is the responsbility of the GuardManager
+  // (caller in this case) to decref.
+  virtual ~GuardAccessor() = default;
+
+ protected:
+  // Guard manager corresponding to the retrieved value from the GuardAccessor.
+  std::unique_ptr<GuardManager> _guard_manager;
+  // accessor key could be py::str for getattr, getitem or py::function for
+  // lambda accessor.
+  py::object _accessor_key;
+};
+
+/**
+ * GuardManager encapsulates all the guards related to a particular py::object.
+ * It is a tree structure and consists of
+ * 1) Leaf guards - Guards that are run on the user given object
+ * 2) Accessors - Guard accessors (like getattr, getitem) to access the next
+ * value in the tree hierarchy. Accessor object also holds the child
+ * GuardManager.
+ *
+ * Lets look at an example to understand how it works.
+ * class Pair:
+ *     int x = 1;
+ *     int y = 2;
+ *
+ * At compile time
+ * >> guard_mananger = GuardManager()
+ * >> guard_mananger.x.add_lambda_guard(
+ *        lambda x: isinstance(x, Pair),
+ *        lambda x: f"expected Pair, found {type(x)}"
+ *    )
+ * >> guard_mananger.x.add_lambda_guard(lambda x: x == 1, lambda x: f"found {x},
+ * expected 1")
+ * >> guard_mananger.y.add_lambda_guard(lambda x: x == 2, lambda x: f"found {x},
+ * expected 2")
+ *
+ * At runtime
+ * >> guard_mananger.check(Pair())
+ *
+ * At compile time we build the tree structure. When we do `guard_manager.x`, it
+ * creates an AttrGuardAccessorNode, initializes a child guard manager with this
+ * accessor node, and adds it as a child. When we do
+ * `guard_manager.x.add_lambda_guard`, we call add_lambda_guard on the newly
+ * created guard manager and register a new leaf guard on it.
+ *
+ * At runtime, the accessor node has an important function of providing a way to
+ * access the value for the child guard. In the above example, guard_manager.x
+ * adds an AttrGuardAccessorNode with attr_name x. When check function is
+ * called, parent GuardManager calls getattr(value, "x") on its value passed to
+ * the check function to call the check function of the child guard manager.
+ *
+ * Performace optimization for fail fast - An optimization for runtime here is
+ * to sort the execution of child guards depending on the failure count.  This
+ * ensures that we run the guards that are more prone to fail statistically
+ * first. This can improve the cache lookup time when we have multiple cache
+ * entries.
+ */
+class GuardManager {
+ public:
+  GuardManager() = delete;
+  GuardManager(RootGuardManager* root) : _root(root) {}
+  GuardManager(const GuardManager& m) = delete;
+  GuardManager& operator=(const GuardManager&) = delete;
+
+  RootGuardManager* get_root() {
+    return _root;
+  }
+
+  void add_leaf_guard(std::shared_ptr<LeafGuard> leaf_guard) {
+    _leaf_guards.emplace_back(std::move(leaf_guard));
+  }
+  /**
+   * Adds a new guard manager with appropriate Accessor. If the accessor is
+   * already present, we just return the guard manager.
+   */
+  template <typename GuardAccessorT>
+  GuardManager* get_child_manager(const py::object& accessor_key) {
+    // accessor_key type depends on the GuardAccessorT
+    // for GetAttrGuardAccessor - py::str name
+    // for GetItemGuardAccessor - py::str name
+
+    // Return the manager if the guard accessor exists
+    for (const auto& accessor : _accessors) {
+      if (accessor->matches_key(accessor_key)) {
+        return accessor->get_guard_manager().get();
+      }
+    }
+
+    // Construct a new guard accessor
+    _accessors.emplace_back(
+        std::make_unique<GuardAccessorT>(_root, accessor_key));
+    return _accessors.back()->get_guard_manager().get();
+  }
+
+  // Runs the leaf guards check and then child managers check function.
+  //
+  // NB: There is some code DUPLICATION between this and check_verbose function.
+  // This is intentional. check function is in the hot path and is kept very
+  // simple. The purpose of check_verbose function is to get guard failure
+  // reasoning to understand recompilations. check_verbose function does not
+  // change the state of the guard, e.g., it does not shuffle the guards and
+  // does not change the fail count. For simplicity, we duplicate the code here.
+  bool check_nopybind(PyObject* value) { // borrowed ref
+    bool result = true;
+    // Iterate over leaf guards
+    for (const auto& guard : _leaf_guards) {
+      result = result && guard->check_nopybind(value);
+      if (!result) { // early exit
+        _fail_count += 1;
+        return result;
+      }
+    }
+
+    // Iterate over accessors.
+    bool failed_on_first = true;
+    for (const auto& accessor : _accessors) {
+      result = result && accessor->check_nopybind(value);
+      if (!result) { // early exit
+        _fail_count += 1;
+        break;
+      }
+      failed_on_first = false;
+    }
+
+    // failed_on_first is just an optimization to avoid sorting if we are
+    // failing on the first accessor itself. This is helpful when we have
+    // already sorted the guards once, and dont need to sort again.
+    if (!result && !failed_on_first) {
+      // Inplace sort the child guards by fail count. This moves the guard with
+      // higher fail count earlier in the queue, and enables fail fast for the
+      // next check_verbose.
+
+      // An alternate implementation was to use priority queue directly on
+      // _accessors, but it was rejected because of the complexity of
+      // popping and creating a new pq on each run_guards. Moreover, this sort
+      // is happening on the unhappy path when check_verbose guard
+      // fails. So, its probably ok.
+      std::sort(
+          _accessors.begin(),
+          _accessors.end(),
+          [](const std::unique_ptr<GuardAccessor>& a,
+             const std::unique_ptr<GuardAccessor>& b) {
+            return a->get_guard_manager()->fail_count() >=
+                b->get_guard_manager()->fail_count();
+          });
+    }
+
+    return result;
+  }
+
+  // This function has some code duplication with function check. This is
+  // deliberate to keep check function simple and fast.
+  GuardDebugInfo check_verbose_nopybind(PyObject* value) { // borrowed ref
+    bool result = true;
+    int num_guards_executed = 0;
+    // Iterate over leaf guards
+    for (const auto& guard : _leaf_guards) {
+      const GuardDebugInfo& debug_info = guard->check_verbose_nopybind(value);
+      result = result && debug_info.result;
+      num_guards_executed++;
+      if (!result) {
+        return GuardDebugInfo(
+            false, debug_info.failed_guard, num_guards_executed);
+      }
+    }
+
+    // Iterate over accessors
+    for (const auto& accessor : _accessors) {
+      const GuardDebugInfo& debug_info =
+          accessor->check_verbose_nopybind(value);
+      result = result && debug_info.result;
+      num_guards_executed += debug_info.num_guards_executed;
+      if (!result) {
+        return GuardDebugInfo(
+            false, debug_info.failed_guard, num_guards_executed);
+      }
+    }
+
+    return GuardDebugInfo(true, "", num_guards_executed);
+  }
+
+  int fail_count() const {
+    return _fail_count;
+  }
+
+  // Returning raw pointers because we can't return unique_ptr and pybind does
+  // not accept a unique_ptr reference return type.
+  std::vector<GuardAccessor*> get_accessors() const {
+    std::vector<GuardAccessor*> ret;
+    for (const auto& accessor : _accessors) {
+      ret.emplace_back(accessor.get());
+    }
+    return ret;
+  }
+
+  // Returning raw pointers because we can't return unique_ptr and pybind does
+  // not accept a unique_ptr reference return type.
+  std::vector<GuardManager*> get_child_managers() const {
+    std::vector<GuardManager*> ret;
+    for (const auto& accessor : _accessors) {
+      ret.emplace_back(accessor->get_guard_manager().get());
+    }
+    return ret;
+  }
+
+  // Returning raw pointers because we can't return unique_ptr and pybind does
+  // not accept a unique_ptr reference return type.
+  std::vector<LeafGuard*> get_leaf_guards() const {
+    std::vector<LeafGuard*> ret;
+    for (const auto& guard : _leaf_guards) {
+      ret.push_back(guard.get());
+    }
+    return ret;
+  }
+
+ private:
+  // Root of the guard manager, this is the used to install the relational guard
+  // resetters.
+  RootGuardManager* _root;
+
+  // Leaf guards are the terminal guards on this object, e.g, type check on a
+  // list. These guards have to be run before any children are run.
+  //
+  // These leaf guards are not shufflable. In almost all cases, these guards
+  // will have an order, e,g., type(x) is int guard and x == 5 guard. We also
+  // expect very few leaf guards per GuardManager node.
+  //
+  // NB: Why are leaf guards shared ptr? This is primarily to enable relational
+  // guards like `tensor X is not tensor Y`. These guards require multiple
+  // values. We handle it by creating one guard object that holds state. This
+  // guard is run N times (for N inputs). For first N-1 invocations, we store
+  // the inputs. For the Nth invocation, it runs the actual check. So, same
+  // object is shared across multiple guard managers, and hence a shared ptr.
+  std::vector<std::shared_ptr<LeafGuard>> _leaf_guards;
+
+  // GuardAccessors nodes to access the child guards. These guards are
+  // shufflable. On a guard failure, they are sorted based on their fail count
+  // to enable fail fast for the next check.
+  std::vector<std::unique_ptr<GuardAccessor>> _accessors;
+
+  // Keeps a count of how many times this guard manager check function returns
+  // False. This is used for sorting optimization.
+  int _fail_count{0};
+};
+
+/**
+ * RootGuardManager is the root of the guard tree. This is primarily constructed
+ * to hold the relational guard pointers so that we can reset the state of those
+ * guards on guard failure. All the other important implementation is in
+ * GuardManager class.
+ */
+
+class RootGuardManager : public GuardManager {
+ public:
+  // This is the root node, set its _root member to nullptr
+  RootGuardManager() : GuardManager(this) {}
+
+  // Adds the relational guard resetter
+  void add_relational_guard_resetter(
+      std::shared_ptr<RelationalGuard> relational_guard) {
+    _relational_guard_resetters.emplace_back(std::move(relational_guard));
+  }
+
+  // Python visible API to check guard function.
+  bool check(py::handle value) {
+    return check_nopybind(value.ptr());
+  }
+
+  // Python visible API to check_verbose guard function.
+  GuardDebugInfo check_verbose(py::handle value) {
+    return check_verbose_nopybind(value.ptr());
+  }
+
+  // Fast check function.
+  bool check_nopybind(PyObject* value) { // borrowed ref
+    bool result = GuardManager::check_nopybind(value);
+    if (!result) {
+      _reset_relational_guard_state();
+    }
+    return result;
+  }
+
+  // Fast check_verbose function.
+  GuardDebugInfo check_verbose_nopybind(PyObject* value) { // borrowed ref
+    GuardDebugInfo debug_info = GuardManager::check_verbose_nopybind(value);
+    if (!debug_info.result) {
+      _reset_relational_guard_state();
+    }
+    return debug_info;
+  }
+
+  std::string repr() const {
+    return "RootGuardManager";
+  }
+
+ private:
+  // Reset the state of all the relational guards on failure.
+  void _reset_relational_guard_state() {
+    for (auto& guard : _relational_guard_resetters) {
+      guard->reset_state_on_guard_failure();
+    }
+  }
+
+ private:
+  // All the relational guards under this guard mananger. We only use these when
+  // the guard evaluates to False. This ensures that guard state is reset on
+  // guard failure so that next invocation is clean.
+  std::vector<std::shared_ptr<RelationalGuard>> _relational_guard_resetters;
+};
+
+/**
+ * Represents __getattr__ acccessor.
+ */
+class GetAttrGuardAccessor : public GuardAccessor {
+ public:
+  GetAttrGuardAccessor(RootGuardManager* root, py::str name)
+      : GuardAccessor(root, name), _attr_name(name.ptr()) {}
+
+  // NB: Intentional duplication between check_nopybind and
+  // check_verbose_nopybind.
+  bool check_nopybind(PyObject* obj) override { // borrowed ref
+    PyObject* x = PyObject_GetAttr(obj, _attr_name); // new ref
+    DEBUG_NULL_CHECK(x);
+    bool result = _guard_manager->check_nopybind(x);
+    Py_DECREF(x);
+    return result;
+  }
+
+  GuardDebugInfo check_verbose_nopybind(
+      PyObject* obj) override { // borrowed ref
+    PyObject* x = PyObject_GetAttr(obj, _attr_name); // new ref
+    DEBUG_NULL_CHECK(x);
+    GuardDebugInfo result = _guard_manager->check_verbose_nopybind(x);
+    Py_DECREF(x);
+    return result;
+  }
+
+  std::string repr() const override {
+    return "GetAttrGuardAccessor(" + py::str(_attr_name).cast<std::string>() +
+        ")";
+  }
+
+ private:
+  PyObject* _attr_name;
+};
+
+/**
+ * Represents dict[name] acccessor. We differentiate it from
+ * GetItemGuardAccessor because PyDict_GetItem should be fastern the
+ * PyObject_GetItem.
+ */
+class GetDictItemGuardAccessor : public GuardAccessor {
+ public:
+  GetDictItemGuardAccessor(RootGuardManager* root, py::str name)
+      : GuardAccessor(root, name), _attr_name(name.ptr()) {}
+
+  // NB: Intentional duplication between check_nopybind and
+  // check_verbose_nopybind.
+  bool check_nopybind(PyObject* obj) override { // borrowed ref
+    PyObject* x = PyDict_GetItem(obj, _attr_name); // borrowed ref
+    DEBUG_NULL_CHECK(x);
+    bool result = _guard_manager->check_nopybind(x);
+    return result;
+  }
+
+  GuardDebugInfo check_verbose_nopybind(
+      PyObject* obj) override { // borrowed ref
+    PyObject* x = PyDict_GetItem(obj, _attr_name); // borrowed ref
+    DEBUG_NULL_CHECK(x);
+    GuardDebugInfo result = _guard_manager->check_verbose_nopybind(x);
+    return result;
+  }
+
+  std::string repr() const override {
+    return "GetDictItemGuardAccessor(" +
+        py::str(_attr_name).cast<std::string>() + ")";
+  }
+
+ private:
+  PyObject* _attr_name;
+};
+
+/**
+ * Represents __getitem__ acccessor.
+ */
+class GetItemGuardAccessor : public GuardAccessor {
+ public:
+  GetItemGuardAccessor(RootGuardManager* root, py::object name)
+      : GuardAccessor(root, name), _attr_name(name.ptr()) {}
+
+  // NB: Intentional duplication between check_nopybind and
+  // check_verbose_nopybind.
+  bool check_nopybind(PyObject* obj) override { // borrowed ref
+    PyObject* x = PyObject_GetItem(obj, _attr_name); // new ref
+    DEBUG_NULL_CHECK(x);
+    bool result = _guard_manager->check_nopybind(x);
+    Py_DECREF(x);
+    return result;
+  }
+
+  GuardDebugInfo check_verbose_nopybind(
+      PyObject* obj) override { // borrowed ref
+    PyObject* x = PyObject_GetItem(obj, _attr_name); // new ref
+    DEBUG_NULL_CHECK(x);
+    GuardDebugInfo result = _guard_manager->check_verbose_nopybind(x);
+    Py_DECREF(x);
+    return result;
+  }
+
+  std::string repr() const override {
+    return "GetItemGuardAccessor(" + py::str(_attr_name).cast<std::string>() +
+        ")";
+  }
+
+ private:
+  PyObject* _attr_name;
+};
+
+/**
+ * Represents global acccessor.
+ */
+class GlobalsGuardAccessor : public GuardAccessor {
+ public:
+  GlobalsGuardAccessor(RootGuardManager* root, py::dict globals_dict)
+      : GuardAccessor(root, globals_dict),
+        _py_globals_dict(globals_dict),
+        _globals_dict(globals_dict.ptr()) {}
+
+  // NB: Intentional duplication between check_nopybind and
+  // check_verbose_nopybind.
+  bool check_nopybind(PyObject* obj) override { // borrowed ref
+    // Ignore the obj arg. Just pass on the globals dict to the child managers.
+    return _guard_manager->check_nopybind(_globals_dict);
+  }
+
+  GuardDebugInfo check_verbose_nopybind(
+      PyObject* obj) override { // borrowed ref
+    // Ignore the obj arg. Just pass on the globals dict to the child managers.
+    return _guard_manager->check_verbose_nopybind(_globals_dict);
+  }
+
+  std::string repr() const override {
+    return "GlobalsGuardAccessor";
+  }
+
+ private:
+  py::dict _py_globals_dict; // holds a reference to the globals dict
+  PyObject* _globals_dict;
+};
+
+/**
+ * Represent type() accessor.
+ */
+class TypeGuardAccessor : public GuardAccessor {
+ public:
+  // name = __type_accessor__, a unique string used as attribute name.
+  TypeGuardAccessor(RootGuardManager* root, py::str name)
+      : GuardAccessor(root, name) {}
+
+  // NB: Intentional duplication between check_nopybind and
+  // check_verbose_nopybind.
+  bool check_nopybind(PyObject* obj) override { // borrowed ref
+    PyObject* x = (PyObject*)Py_TYPE(obj); // borrowed ref
+    bool result = _guard_manager->check_nopybind(x);
+    return result;
+  }
+
+  GuardDebugInfo check_verbose_nopybind(
+      PyObject* obj) override { // borrowed ref
+    PyObject* x = (PyObject*)Py_TYPE(obj); // borrowed ref
+    GuardDebugInfo result = _guard_manager->check_verbose_nopybind(x);
+    return result;
+  }
+
+  std::string repr() const override {
+    return "TypeGuardAccessor";
+  }
+};
+
+/**
+ * Similar to PythonLambdaLeafGuard, this class is a way to allow developers
+ * to supply accessor as a python function. This way, we can gradually move
+ * accessors for different sources in C++.
+ */
+class PythonLambdaGuardAccessor : public GuardAccessor {
+ public:
+  PythonLambdaGuardAccessor(RootGuardManager* root, py::function accessor_fn)
+      : GuardAccessor(root, accessor_fn), _accessor_fn(accessor_fn.ptr()) {}
+
+  // NB: Intentional duplication between check_nopybind and
+  // check_verbose_nopybind.
+  bool check_nopybind(PyObject* obj) override { // borrowed ref
+    PyObject* x = PyObject_CallOneArg(_accessor_fn, obj); // new ref
+    bool result = _guard_manager->check_nopybind(x);
+    Py_DECREF(x);
+    return result;
+  }
+
+  GuardDebugInfo check_verbose_nopybind(
+      PyObject* obj) override { // borrowed ref
+    PyObject* x = PyObject_CallOneArg(_accessor_fn, obj); // new ref
+    GuardDebugInfo result = _guard_manager->check_verbose_nopybind(x);
+    Py_DECREF(x);
+    return result;
+  }
+
+  std::string repr() const override {
+    return "PythonLambdaGuardAccessor";
+  }
+
+ private:
+  PyObject* _accessor_fn;
+};
+
+void install_no_tensor_aliasing_guard(
+    GuardManager* x,
+    GuardManager* y,
+    py::object guard_str) {
+  // TODO(anijain2305) - Support arbitrary number of tensors instead of just
+  // two. Adds tensor X is not tensor Y. This is a an example of relational
+  // guard. There is one guard object that is shared between two guard managers.
+  std::shared_ptr<RelationalGuard> guard =
+      std::make_shared<NoTensorAliasingGuard>(guard_str);
+
+  // Register the resetter on the toor gaurd mananger, so that it can reset the
+  // newly added relational guard when the guard eval fails.
+  x->get_root()->add_relational_guard_resetter(guard);
+  x->add_leaf_guard(guard);
+  y->add_leaf_guard(guard);
+}
+
 } // namespace
 
 static void* _torchinductor_pyobject_tensor_data_ptr(PyObject* obj) {
@@ -669,6 +1516,183 @@ PyObject* torch_c_dynamo_guards_init() {
               &_torchinductor_pyobject_tensor_data_ptr))) < 0) {
     return nullptr;
   }
+  auto py_m = py::handle(m).cast<py::module>();
+  py::class_<GuardDebugInfo, std::unique_ptr<GuardDebugInfo>>(
+      py_m, "GuardDebugInfo")
+      .def(py::init<bool, std::string, int>())
+      .def_readonly("result", &GuardDebugInfo::result)
+      .def_readonly("failed_guard", &GuardDebugInfo::failed_guard)
+      .def_readonly(
+          "num_guards_executed", &GuardDebugInfo::num_guards_executed);
+
+  // Leaf Guards
+  py::class_<LeafGuard, std::shared_ptr<LeafGuard>>(py_m, "LeafGuard")
+      .def("repr", &LeafGuard::repr);
+
+  py::class_<PythonLambdaGuard, LeafGuard, std::shared_ptr<PythonLambdaGuard>>(
+      py_m, "PythonLambdaGuard")
+      .def(py::init<py::function, py::str>())
+      .def("__call__", &PythonLambdaGuard::check);
+  py::class_<TYPE_MATCH, LeafGuard, std::shared_ptr<TYPE_MATCH>>(
+      py_m, "TYPE_MATCH")
+      .def(py::init<py::object, py::str>())
+      .def("__call__", &TYPE_MATCH::check);
+  py::class_<ID_MATCH, LeafGuard, std::shared_ptr<ID_MATCH>>(py_m, "ID_MATCH")
+      .def(py::init<py::object, py::str>())
+      .def("__call__", &ID_MATCH::check);
+  py::class_<EQUALS_MATCH, LeafGuard, std::shared_ptr<EQUALS_MATCH>>(
+      py_m, "EQUALS_MATCH")
+      .def(py::init<py::object, py::str>())
+      .def("__call__", &EQUALS_MATCH::check);
+  py::class_<LENGTH_CHECK, LeafGuard, std::shared_ptr<LENGTH_CHECK>>(
+      py_m, "LENGTH_CHECK")
+      .def(py::init<py::object, py::str>())
+      .def("__call__", &LENGTH_CHECK::check);
+  py::class_<DICT_KEYS, LeafGuard, std::shared_ptr<DICT_KEYS>>(
+      py_m, "DICT_KEYS")
+      .def(py::init<py::object, py::str>())
+      .def("__call__", &DICT_KEYS::check);
+  py::class_<NoTensorAliasingGuard, std::shared_ptr<NoTensorAliasingGuard>>(
+      py_m, "NoTensorAliasingGuard");
+
+  // Guard Accessors - These are present so that we can iterate over the
+  // GuardManager hierarchy. We intentionally do not provide even an init
+  // function on these, because these should be constructed from within C++.
+  py::class_<GuardAccessor, std::unique_ptr<GuardAccessor>>(
+      py_m, "GuardAccessor")
+      .def("repr", &GuardAccessor::repr);
+
+  py::class_<
+      GetAttrGuardAccessor,
+      GuardAccessor,
+      std::unique_ptr<GetAttrGuardAccessor>>(py_m, "GetAttrGuardAccessor");
+  py::class_<
+      GetItemGuardAccessor,
+      GuardAccessor,
+      std::unique_ptr<GetItemGuardAccessor>>(py_m, "GetItemGuardAccessor");
+  py::class_<
+      GetDictItemGuardAccessor,
+      GuardAccessor,
+      std::unique_ptr<GetDictItemGuardAccessor>>(
+      py_m, "GetDictItemGuardAccessor");
+  py::class_<
+      GlobalsGuardAccessor,
+      GuardAccessor,
+      std::unique_ptr<GlobalsGuardAccessor>>(py_m, "GlobalsGuardAccessor");
+  py::class_<
+      TypeGuardAccessor,
+      GuardAccessor,
+      std::unique_ptr<TypeGuardAccessor>>(py_m, "TypeGuardAccessor");
+
+  // Guard Manager - No constructor in python, python should use
+  // RootGuardManager.
+  py::class_<GuardManager, std::unique_ptr<GuardManager>>(py_m, "GuardManager")
+      // return by reference because GuardManager has the ownership of accessors
+      .def(
+          "get_accessors",
+          &GuardManager::get_accessors,
+          py::return_value_policy::reference)
+      // return by reference because GuardManager has the ownership of child
+      // managers
+      .def(
+          "get_child_managers",
+          &GuardManager::get_child_managers,
+          py::return_value_policy::reference)
+      // return by reference because GuardManager has the ownership of leaf
+      // guards
+      .def(
+          "get_leaf_guards",
+          &GuardManager::get_leaf_guards,
+          py::return_value_policy::reference)
+      .def(
+          "add_lambda_guard",
+          [](GuardManager& self,
+             py::object lambda,
+             py::object guard_str) -> void {
+            self.add_leaf_guard(
+                std::make_shared<PythonLambdaGuard>(lambda, guard_str));
+          })
+      .def(
+          "add_type_match_guard",
+          [](GuardManager& self,
+             py::object value,
+             py::object guard_str) -> void {
+            self.add_leaf_guard(std::make_shared<TYPE_MATCH>(value, guard_str));
+          })
+      .def(
+          "add_id_match_guard",
+          [](GuardManager& self,
+             py::object value,
+             py::object guard_str) -> void {
+            self.add_leaf_guard(std::make_shared<ID_MATCH>(value, guard_str));
+          })
+      .def(
+          "add_equals_match_guard",
+          [](GuardManager& self,
+             py::object value,
+             py::object guard_str) -> void {
+            self.add_leaf_guard(
+                std::make_shared<EQUALS_MATCH>(value, guard_str));
+          })
+      .def(
+          "add_length_check_guard",
+          [](GuardManager& self,
+             py::object value,
+             py::object guard_str) -> void {
+            self.add_leaf_guard(
+                std::make_shared<LENGTH_CHECK>(value, guard_str));
+          })
+      .def(
+          "add_dict_keys_guard",
+          [](GuardManager& self,
+             py::object value,
+             py::object guard_str) -> void {
+            self.add_leaf_guard(std::make_shared<DICT_KEYS>(value, guard_str));
+          })
+      // return by reference because GuardManager has the ownership of accessors
+      // and guard managers
+      .def(
+          "__getattr__",
+          &GuardManager::get_child_manager<GetAttrGuardAccessor>,
+          py::return_value_policy::reference)
+      // return by reference because GuardManager has the ownership of accessors
+      // and guard managers
+      .def(
+          "__getitem__",
+          &GuardManager::get_child_manager<GetItemGuardAccessor>,
+          py::return_value_policy::reference)
+      // return by reference because GuardManager has the ownership of accessors
+      // and guard managers
+      .def(
+          "dict_get_item_manager",
+          &GuardManager::get_child_manager<GetDictItemGuardAccessor>,
+          py::return_value_policy::reference)
+      .def(
+          "globals_dict_manager",
+          &GuardManager::get_child_manager<GlobalsGuardAccessor>,
+          py::return_value_policy::reference)
+      .def(
+          "type_manager",
+          [](GuardManager& self) -> GuardManager* {
+            py::str unique_key("__type_accessor__");
+            return self.get_child_manager<TypeGuardAccessor>(unique_key);
+          },
+          py::return_value_policy::reference)
+      .def(
+          "lambda_manager",
+          &GuardManager::get_child_manager<PythonLambdaGuardAccessor>,
+          py::return_value_policy::reference);
+
+  // Guard Manager
+  py::class_<RootGuardManager, GuardManager, std::unique_ptr<RootGuardManager>>(
+      py_m, "RootGuardManager")
+      .def(py::init<>())
+      .def("repr", &RootGuardManager::repr)
+      .def("check", &RootGuardManager::check)
+      .def("check_verbose", &RootGuardManager::check_verbose);
+
+  py_m.def(
+      "install_no_tensor_aliasing_guard", install_no_tensor_aliasing_guard);
 
   return m;
 }
