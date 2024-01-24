@@ -53,7 +53,9 @@ class SimpleProfiler:
 
     @classmethod
     def dump_and_reset(cls, msg: str) -> None:
-        logger.warning("%s %s", msg, str(cls.results))
+        # This cannot be combined with DETAIL distributed log
+        # as the profiling will be very incorrect.
+        logger.debug("%s %s", msg, str(cls.results))
         cls.reset()
 
 
