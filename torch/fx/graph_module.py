@@ -196,7 +196,8 @@ def _deserialize_graph_module(forward, body: Dict[Any, Any], graph_module_cls=No
     # referencing the private local subclass KeepModules.
     graph._tracer_cls = tracer_cls
     if graph_module_cls is None:
-        graph_module_cls = GraphModule
+        from .lazy_graph_module import get_graph_module_cls
+        graph_module_cls = get_graph_module_cls()
     gm = graph_module_cls(com, graph, class_name=graphmodule_cls_name)
 
     # The GraphModule constructor only retains attributes referenced by the graph.
@@ -316,7 +317,6 @@ class _WrappedCall:
                 raise e.with_traceback(None)  # noqa: TRY200
             else:
                 raise e
-
 
 @compatibility(is_backward_compatible=True)
 class GraphModule(torch.nn.Module):
@@ -777,6 +777,7 @@ class {module_name}(torch.nn.Module):
         code to regenerate the underlying ``Graph``
         """
         dict_without_graph = self.__dict__.copy()
+
         python_code = self.recompile()
         import_block = _format_import_block(python_code.globals, sys_importer)
         del dict_without_graph["_graph"]
@@ -813,7 +814,8 @@ class {module_name}(torch.nn.Module):
         return res
 
     def __copy__(self):
-        res = GraphModule(self, self.graph)
+        from .lazy_graph_module import get_graph_module_cls
+        res = get_graph_module_cls()(self, self.graph)
         res.meta = getattr(self, "meta", {})
         return res
 

@@ -9,6 +9,8 @@ import typing
 import weakref
 from typing import Any, Callable, Dict, List, Optional, Set
 
+from torch.fx import _use_lazy_graph_module  # type: ignore[attr-defined]
+
 try:
     import numpy as np
 except ModuleNotFoundError:
@@ -432,6 +434,7 @@ def register_bytecode_hook(hook: BytecodeHook) -> RemovableHandle:
     return handle
 
 
+@_use_lazy_graph_module(config.use_lazy_graph_module)
 @maybe_cprofile
 def _compile(
     code: types.CodeType,
