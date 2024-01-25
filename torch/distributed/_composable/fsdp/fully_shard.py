@@ -1,4 +1,4 @@
-from typing import Any, Optional
+from typing import Any, cast, Optional, Union
 
 import typing_extensions
 
@@ -12,12 +12,13 @@ from ._fsdp_common import FSDPMeshInfo, HSDPMeshInfo
 from ._fsdp_init import (
     _get_managed_modules,
     _get_managed_states,
+    _get_post_forward_mesh_info,
     _init_default_fully_shard_mesh,
     _move_states_to_device,
     _normalize_device,
 )
 from ._fsdp_param_group import FSDPParamGroup
-from ._fsdp_state import FSDPState
+from ._fsdp_state import _get_module_fsdp_state, FSDPState
 
 
 # The decorator adds a state object to `module` that can be accessed via
@@ -28,7 +29,21 @@ def fully_shard(
     *,
     mesh: Optional[DeviceMesh] = None,
     device: DeviceLikeType = "cuda",
+    reshard_after_forward: Union[bool, int] = True,
 ):
+    """
+    Args:
+        reshard_after_forward (Union[bool, int]): This controls the parameter
+            behavior after forward and can trade off memory and communication.
+            - If ``True``, then this reshards parameters after forward and
+            all-gathers in backward.
+            - If ``False``, then this keeps the unsharded parameters in memory
+            after forward and avoids the all-gather in backward.
+            - If an ``int``, then this represents the world size to reshard to
+            after forward. It should be a number between 1 and the ``mesh``
+            shard dimension size exclusive. A common choice may be the
+            intra-node size (i.e. ``torch.cuda.device_count()``).
+    """
     if isinstance(module, (nn.ModuleList, nn.ModuleDict)):
         raise ValueError(
             f"fully_shard does not support containers that do not implement forward: {module}"
@@ -46,6 +61,9 @@ def fully_shard(
             f"device and mesh must be of the same type but got {device.type} "
             f"for device and {mesh.device_type} for mesh"
         )
+    post_forward_mesh_info = _get_post_forward_mesh_info(
+        reshard_after_forward, mesh_info
+    )
 
     state = fully_shard.state(module)
     state.init(module, device)
@@ -54,7 +72,9 @@ def fully_shard(
     params, buffers = _get_managed_states(managed_modules)
     _move_states_to_device(params, buffers, device, mesh_info)
     if params:
-        state._fsdp_param_group = FSDPParamGroup(params, module, mesh_info, device)
+        state._fsdp_param_group = FSDPParamGroup(
+            params, module, mesh_info, post_forward_mesh_info, device
+        )
 
     # Place FSDP leftmost for highest priority in the method resolution order
     cls = module.__class__
@@ -82,3 +102,14 @@ class FSDP:
         self = orig_cls.__new__(orig_cls, *args, **kwargs)
         self.__init__(*args, **kwargs)
         return self
+
+    def reshard(self) -> None:
+        """
+        Reshards the module's parameters by freeing unsharded parameters if
+        needed. This method is *not* recursive.
+        """
+        if (state := _get_module_fsdp_state(cast(nn.Module, self))) is None or (
+            (fsdp_param_group := state._fsdp_param_group) is None
+        ):
+            return  # no-op
+        fsdp_param_group.reshard()
