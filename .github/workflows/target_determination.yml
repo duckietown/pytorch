@@ -1,0 +1,33 @@
+name: target-determination
+
+on:
+  workflow_call:
+
+jobs:
+  target-determination:
+    # Don't run on forked repos
+    if: github.repository_owner == 'pytorch'
+    runs-on: ubuntu-latest
+    steps:
+      # [pytorch repo ref]
+      # Use a pytorch/pytorch reference instead of a reference to the local
+      # checkout because when we run this action we don't *have* a local
+      # checkout. In other cases you should prefer a local checkout.
+      - name: Checkout PyTorch
+        uses: pytorch/pytorch/.github/actions/checkout-pytorch@main
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.8'
+
+      - name: Download pytest cache
+        uses: ./.github/actions/pytest-cache-download
+        continue-on-error: true
+        with:
+          cache_dir: .pytest_cache
+          job_identifier: ${{ github.workflow }}
+
+      - name: Do TD
+        run: |
+          python tools/testing/do_target_determination_for_s3.py
